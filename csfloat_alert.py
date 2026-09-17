@@ -1,9 +1,6 @@
 from pathlib import Path
 import zipfile, json
 
-base = Path("/mnt/data/csfloat_github_actions")
-base.mkdir(exist_ok=True)
-(base / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
 
 script = r'''import json
 import os
