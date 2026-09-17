@@ -1,0 +1,17 @@
+name: Discord Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send test message to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          curl -H "Content-Type: application/json" \
+            -d '{"content":"**TESTE CSFloat** — O sistema de alertas do GitHub consegue enviar mensagens para o Discord."}' \
+            "$DISCORD_WEBHOOK"
