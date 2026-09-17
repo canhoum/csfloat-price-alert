@@ -13,11 +13,11 @@ STATE_FILE = Path("state.json")
 
 BASE_URL = "https://csfloat.com/api/v1/history/{}/sales"
 
-# Intervalo entre mensagens do Discord
 DISCORD_DELAY_SECONDS = 2.2
 
-# Limite de segurança de vendas processadas por execução
-MAX_SALES_PER_RUN = 20
+STATE_VERSION = 3
+
+MAX_STORED_SALES = 500
 
 
 def load_json(path, default):
@@ -40,29 +40,37 @@ def save_json(path, data):
     )
 
 
-def get_sale_id(sale):
+def get_asset_id(sale):
+    item = sale.get("item")
+
+    if isinstance(item, dict):
+        return str(
+            item.get("asset_id", "")
+        )
+
+    return ""
+
+
+def get_sale_key(sale):
     """
-    Cria um identificador para uma venda.
+    Cria um identificador estável para uma venda.
 
-    Preferimos o ID oficial da venda.
-    Se não existir, usamos uma combinação de
-    data + preço + asset.
+    Usamos:
+        created_at
+        sold_at
+        price
+        asset_id
+
+    O ID da venda é usado apenas como fallback.
     """
-
-    for key in (
-        "id",
-        "sale_id",
-        "contract_id",
-        "listing_id"
-    ):
-        value = sale.get(key)
-
-        if value:
-            return str(value)
 
     created_at = (
         sale.get("created_at")
-        or sale.get("sold_at")
+        or ""
+    )
+
+    sold_at = (
+        sale.get("sold_at")
         or ""
     )
 
@@ -74,26 +82,43 @@ def get_sale_id(sale):
         )
     )
 
-    asset_id = ""
+    asset_id = get_asset_id(
+        sale
+    )
 
-    item = sale.get("item")
+    # Fingerprint estável
+    if created_at or sold_at or asset_id:
 
-    if isinstance(item, dict):
-        asset_id = item.get(
-            "asset_id",
-            ""
+        return (
+            f"fp|"
+            f"{created_at}|"
+            f"{sold_at}|"
+            f"{price}|"
+            f"{asset_id}"
         )
 
+    # Fallback
+    for key in (
+        "id",
+        "sale_id",
+        "contract_id",
+        "listing_id"
+    ):
+        value = sale.get(key)
+
+        if value:
+            return f"id|{value}"
+
     return (
-        f"{created_at}|"
-        f"{price}|"
-        f"{asset_id}"
+        f"fallback|"
+        f"{price}"
     )
 
 
 def extract_sales(payload):
 
     if isinstance(payload, list):
+
         raw = payload
 
     elif isinstance(payload, dict):
@@ -115,13 +140,17 @@ def extract_sales(payload):
         )
 
     else:
+
         raw = []
 
     sales = []
 
     for sale in raw:
 
-        if not isinstance(sale, dict):
+        if not isinstance(
+            sale,
+            dict
+        ):
             continue
 
         price = sale.get(
@@ -136,7 +165,10 @@ def extract_sales(payload):
             continue
 
         try:
-            price_eur = float(price) / 100.0
+
+            price_eur = (
+                float(price) / 100.0
+            )
 
         except (
             TypeError,
@@ -144,17 +176,28 @@ def extract_sales(payload):
         ):
             continue
 
-        sale_id = get_sale_id(sale)
-
         sales.append(
             {
-                "id": sale_id,
+                "key": get_sale_key(
+                    sale
+                ),
+
+                "id": str(
+                    sale.get(
+                        "id",
+                        ""
+                    )
+                ),
 
                 "price_eur": price_eur,
 
                 "created_at": (
-                    sale.get("created_at")
-                    or sale.get("sold_at")
+                    sale.get(
+                        "created_at"
+                    )
+                    or sale.get(
+                        "sold_at"
+                    )
                 )
             }
         )
@@ -165,7 +208,10 @@ def extract_sales(payload):
 def fetch_sales(name):
 
     url = BASE_URL.format(
-        quote(name, safe="")
+        quote(
+            name,
+            safe=""
+        )
     )
 
     response = requests.get(
@@ -193,7 +239,8 @@ def send_discord(
 ):
 
     above_median = (
-        sale["price_eur"] > baseline
+        sale["price_eur"]
+        > baseline
     )
 
     mention = (
@@ -231,21 +278,22 @@ def send_discord(
             timeout=30
         )
 
-        # Discord webhook enviado com sucesso
         if response.status_code in (
             200,
             204
         ):
             return True
 
-        # Rate limit do Discord
         if response.status_code == 429:
 
-            retry_after = response.headers.get(
-                "Retry-After"
+            retry_after = (
+                response.headers.get(
+                    "Retry-After"
+                )
             )
 
             try:
+
                 wait_seconds = float(
                     retry_after
                 )
@@ -254,9 +302,9 @@ def send_discord(
                 TypeError,
                 ValueError
             ):
+
                 wait_seconds = 5.0
 
-            # Segurança adicional
             wait_seconds = max(
                 wait_seconds,
                 2.5
@@ -293,23 +341,24 @@ def send_discord(
 
 def main():
 
-    # --------------------------------------------------
-    # DISCORD WEBHOOK
-    # --------------------------------------------------
+    # ==================================================
+    # DISCORD
+    # ==================================================
 
     webhook = os.environ.get(
         "DISCORD_WEBHOOK"
     )
 
     if not webhook:
+
         raise SystemExit(
             "DISCORD_WEBHOOK não está "
             "configurado no GitHub Secrets."
         )
 
-    # --------------------------------------------------
-    # CONFIGURAÇÃO
-    # --------------------------------------------------
+    # ==================================================
+    # CONFIG
+    # ==================================================
 
     config = load_json(
         CONFIG_FILE,
@@ -321,39 +370,42 @@ def main():
         }
     )
 
-    # --------------------------------------------------
-    # ESTADO
-    # --------------------------------------------------
+    # ==================================================
+    # STATE
+    # ==================================================
 
     state = load_json(
         STATE_FILE,
-        {
-            "sent": {}
-        }
+        {}
     )
 
-    # --------------------------------------------------
-    # COMPATIBILIDADE COM O ESTADO ANTIGO
-    # --------------------------------------------------
+    old_state = state
 
-    if "sent" not in state:
+    # ==================================================
+    # DETETAR SE PRECISAMOS DE REINICIALIZAR
+    # ==================================================
 
-        if "seen" in state:
+    needs_reinitialization = (
+        state.get(
+            "version"
+        ) != STATE_VERSION
+    )
 
-            state["sent"] = state["seen"]
+    if needs_reinitialization:
 
-            print(
-                "[MIGRATE] Estado antigo encontrado. "
-                "A converter 'seen' para 'sent'."
-            )
+        print(
+            "[RESET] A criar novo estado "
+            "com identificadores estáveis."
+        )
 
-        else:
+        state = {
+            "version": STATE_VERSION,
+            "sent": {}
+        }
 
-            state["sent"] = {}
-
-    # --------------------------------------------------
-    # PROCESSAR ITEMS
-    # --------------------------------------------------
+    # ==================================================
+    # ITEMS
+    # ==================================================
 
     for item in config.get(
         "items",
@@ -378,9 +430,9 @@ def main():
             **item
         }
 
-        # --------------------------------------------------
-        # OBTER VENDAS DA CSFLOAT
-        # --------------------------------------------------
+        # ==================================================
+        # OBTER VENDAS
+        # ==================================================
 
         try:
 
@@ -405,79 +457,89 @@ def main():
 
             continue
 
-        # --------------------------------------------------
-        # VENDAS JÁ PROCESSADAS
-        # --------------------------------------------------
+        # ==================================================
+        # PRIMEIRA EXECUÇÃO DA NOVA VERSÃO
+        # ==================================================
 
-        sent_ids = set(
-            state["sent"].get(
+        #
+        # IMPORTANTE:
+        #
+        # As 40 vendas que estão atualmente na API
+        # serão usadas como baseline.
+        #
+        # NÃO serão enviadas para o Discord.
+        #
+
+        if needs_reinitialization:
+
+            state["sent"][name] = [
+                sale["key"]
+                for sale in sales
+            ][
+                :MAX_STORED_SALES
+            ]
+
+            print(
+                f"[RESET] {name}: "
+                f"{len(sales)} vendas "
+                "registadas como existentes. "
+                "Nenhum alerta enviado."
+            )
+
+            continue
+
+        # ==================================================
+        # VENDAS JÁ ENVIADAS
+        # ==================================================
+
+        sent_keys = set(
+            state.get(
+                "sent",
+                {}
+            ).get(
                 name,
                 []
             )
         )
 
-        # --------------------------------------------------
-        # PRIMEIRA EXECUÇÃO
-        # --------------------------------------------------
-
-        if name not in state["sent"]:
-
-            state["sent"][name] = [
-                sale["id"]
-                for sale in sales
-            ][:500]
-
-            print(
-                f"[INIT] {name}: "
-                f"{len(sales)} vendas "
-                "registadas sem alertas."
-            )
-
-            continue
-
-        # --------------------------------------------------
-        # DETETAR NOVAS VENDAS
-        # --------------------------------------------------
+        # ==================================================
+        # NOVAS VENDAS
+        # ==================================================
 
         pending_sales = [
             sale
-            for sale in reversed(sales)
-            if sale["id"] not in sent_ids
+            for sale in reversed(
+                sales
+            )
+            if sale["key"]
+            not in sent_keys
         ]
 
         print(
             f"[CHECK] {name}: "
             f"{len(sales)} vendas, "
-            f"{len(pending_sales)} pendentes."
+            f"{len(pending_sales)} novas."
         )
 
         if not pending_sales:
+
             continue
 
-        # --------------------------------------------------
-        # LIMITE DE SEGURANÇA
-        # --------------------------------------------------
+        # ==================================================
+        # PROCESSAR NOVAS VENDAS
+        # ==================================================
 
-        sales_to_process = (
-            pending_sales[
-                :MAX_SALES_PER_RUN
-            ]
-        )
-
-        # --------------------------------------------------
-        # PROCESSAR CADA VENDA
-        # --------------------------------------------------
-
-        for sale in sales_to_process:
+        for sale in pending_sales:
 
             # --------------------------------------------------
-            # CALCULAR MEDIANA
+            # MEDIANA
             # --------------------------------------------------
 
             comparison = [
                 other["price_eur"]
                 for other in sales
-                if other["id"] != sale["id"]
+                if other["key"]
+                != sale["key"]
             ][:int(
                 rule.get(
                     "baseline_sales",
@@ -500,7 +562,7 @@ def main():
             )
 
             # --------------------------------------------------
-            # CALCULAR DIFERENÇA
+            # MULTIPLICADOR
             # --------------------------------------------------
 
             multiplier = (
@@ -517,7 +579,7 @@ def main():
             )
 
             # --------------------------------------------------
-            # ENVIAR PARA DISCORD
+            # DISCORD
             # --------------------------------------------------
 
             success = send_discord(
@@ -528,29 +590,27 @@ def main():
                 multiplier
             )
 
-            # --------------------------------------------------
-            # SE ENVIOU COM SUCESSO
-            # --------------------------------------------------
-
             if success:
 
-                sent_ids.add(
-                    sale["id"]
+                sent_keys.add(
+                    sale["key"]
                 )
 
                 state["sent"][name] = list(
-                    sent_ids
-                )[-500:]
+                    sent_keys
+                )[
+                    -MAX_STORED_SALES:
+                ]
 
-                # Guardar imediatamente.
-                # Assim, se o GitHub parar a execução,
-                # não perdemos as vendas já notificadas.
                 save_json(
                     STATE_FILE,
                     state
                 )
 
-                if sale["price_eur"] > baseline:
+                if (
+                    sale["price_eur"]
+                    > baseline
+                ):
 
                     print(
                         "[SENT] "
@@ -564,10 +624,6 @@ def main():
                         "Notificação normal enviada."
                     )
 
-            # --------------------------------------------------
-            # SE FALHOU
-            # --------------------------------------------------
-
             else:
 
                 print(
@@ -577,16 +633,16 @@ def main():
                 )
 
             # --------------------------------------------------
-            # ESPERA ENTRE MENSAGENS
+            # DELAY
             # --------------------------------------------------
 
             time.sleep(
                 DISCORD_DELAY_SECONDS
             )
 
-    # --------------------------------------------------
-    # GUARDAR ESTADO FINAL
-    # --------------------------------------------------
+    # ==================================================
+    # GUARDAR ESTADO
+    # ==================================================
 
     save_json(
         STATE_FILE,
