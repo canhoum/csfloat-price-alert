@@ -300,16 +300,27 @@ def main():
     )
 
     state = load_json(
-        STATE_FILE,
-        {
-            "sent": {}
-        }
-    )
+    STATE_FILE,
+    {
+        "sent": {}
+    }
+)
 
-    # Compatibilidade com o estado antigo.
-    if "sent" not in state:
+# Compatibilidade com o estado antigo.
+# A versão anterior guardava as vendas em "seen".
+# Mantemos essas vendas para não as voltar a notificar.
+if "sent" not in state:
+
+    if "seen" in state:
+        state["sent"] = state["seen"]
+
+        print(
+            "[MIGRATE] Estado antigo encontrado. "
+            "A converter 'seen' para 'sent'."
+        )
+
+    else:
         state["sent"] = {}
-
     for item in config.get(
         "items",
         []
