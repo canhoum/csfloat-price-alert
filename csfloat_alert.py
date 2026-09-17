@@ -111,19 +111,29 @@ def send_discord(
     baseline,
     multiplier
 ):
+    above_median = sale["price_eur"] > baseline
+
+    mention = "@everyone\n" if above_median else ""
+
     content = (
-        "**CSFloat PRICE SPIKE**\n"
+        f"{mention}"
+        "**CSFloat SALE**\n"
         f"Item: `{name}`\n"
         f"Sale: **€{sale['price_eur']:.2f}**\n"
         f"Median baseline: €{baseline:.2f}\n"
-        f"Multiple: **{multiplier:.2f}×**\n"
+        f"Difference: **{multiplier:.2f}×**\n"
         f"CSFloat: https://csfloat.com/search?"
         f"market_hash_name={quote(name)}"
     )
 
     response = requests.post(
         webhook,
-        json={"content": content},
+        json={
+            "content": content,
+            "allowed_mentions": {
+                "parse": ["everyone"] if above_median else []
+            }
+        },
         timeout=30
     )
 
@@ -143,8 +153,6 @@ def main():
         CONFIG_FILE,
         {
             "default_rule": {
-                "absolute_price_eur": 0.80,
-                "multiple_of_median": 2.0,
                 "baseline_sales": 100
             },
             "items": []
@@ -187,8 +195,7 @@ def main():
             continue
 
         # Primeira execução:
-        # guardar as vendas atuais sem enviar alertas
-        # para vendas antigas.
+        # guardar as vendas existentes sem notificações.
         if (
             not state_exists
             or name not in state["seen"]
@@ -242,47 +249,30 @@ def main():
                 else 0
             )
 
-            absolute_hit = (
-                sale["price_eur"]
-                >= float(
-                    rule.get(
-                        "absolute_price_eur",
-                        0.80
+            try:
+                send_discord(
+                    webhook,
+                    name,
+                    sale,
+                    baseline,
+                    multiplier
+                )
+
+                print(
+                    f"[SALE] {name}: "
+                    f"€{sale['price_eur']:.2f} "
+                    f"({multiplier:.2f}x)"
+                    + (
+                        " @everyone"
+                        if sale["price_eur"] > baseline
+                        else ""
                     )
                 )
-            )
 
-            multiple_hit = (
-                multiplier
-                >= float(
-                    rule.get(
-                        "multiple_of_median",
-                        2.0
-                    )
+            except Exception as exc:
+                print(
+                    f"[DISCORD ERROR] {exc}"
                 )
-            )
-
-            if absolute_hit or multiple_hit:
-
-                try:
-                    send_discord(
-                        webhook,
-                        name,
-                        sale,
-                        baseline,
-                        multiplier
-                    )
-
-                    print(
-                        f"[ALERT] {name}: "
-                        f"€{sale['price_eur']:.2f} "
-                        f"({multiplier:.2f}x)"
-                    )
-
-                except Exception as exc:
-                    print(
-                        f"[DISCORD ERROR] {exc}"
-                    )
 
         state["seen"][name] = list(
             dict.fromkeys(

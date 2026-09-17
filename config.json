@@ -1,16 +1,11 @@
 {
-  
-"check_every_seconds": 120,
+    "check_every_seconds": 120,
     "default_rule": {
-        "absolute_price_eur": 0.80,
-        "multiple_of_median": 2.0,
         "baseline_sales": 100
     },
     "items": [
         {
             "market_hash_name": "Fracture Case",
-            "absolute_price_eur": 0.80,
-            "multiple_of_median": 2.0,
             "enabled": true
         }
     ]
