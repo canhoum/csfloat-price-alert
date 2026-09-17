@@ -1,6 +1,7 @@
 import json
 import os
 import statistics
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -12,18 +13,80 @@ STATE_FILE = Path("state.json")
 
 BASE_URL = "https://csfloat.com/api/v1/history/{}/sales"
 
+# Discord permite um número limitado de mensagens por minuto.
+# Mantemos um intervalo seguro entre mensagens.
+DISCORD_DELAY_SECONDS = 2.2
+
+# Se houver muitas vendas pendentes, não tentamos enviar todas
+# na mesma execução.
+MAX_SALES_PER_RUN = 20
+
 
 def load_json(path, default):
     if not path.exists():
         return default
 
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(
+        path.read_text(encoding="utf-8")
+    )
 
 
 def save_json(path, data):
     path.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False),
+        json.dumps(
+            data,
+            indent=2,
+            ensure_ascii=False
+        ),
         encoding="utf-8"
+    )
+
+
+def get_sale_id(sale):
+    """
+    Cria um identificador estável para uma venda.
+    Preferimos o ID oficial da venda.
+    """
+
+    for key in (
+        "id",
+        "sale_id",
+        "contract_id",
+        "listing_id"
+    ):
+        value = sale.get(key)
+
+        if value:
+            return str(value)
+
+    created_at = (
+        sale.get("created_at")
+        or sale.get("sold_at")
+        or ""
+    )
+
+    price = sale.get(
+        "price",
+        sale.get(
+            "sale_price",
+            sale.get("amount", "")
+        )
+    )
+
+    item = sale.get("item")
+
+    asset_id = ""
+
+    if isinstance(item, dict):
+        asset_id = item.get(
+            "asset_id",
+            ""
+        )
+
+    return (
+        f"{created_at}|"
+        f"{price}|"
+        f"{asset_id}"
     )
 
 
@@ -35,8 +98,15 @@ def extract_sales(payload):
         raw = next(
             (
                 payload[key]
-                for key in ("sales", "data", "results")
-                if isinstance(payload.get(key), list)
+                for key in (
+                    "sales",
+                    "data",
+                    "results"
+                )
+                if isinstance(
+                    payload.get(key),
+                    list
+                )
             ),
             []
         )
@@ -47,6 +117,7 @@ def extract_sales(payload):
     sales = []
 
     for sale in raw:
+
         if not isinstance(sale, dict):
             continue
 
@@ -63,19 +134,17 @@ def extract_sales(payload):
 
         try:
             price_eur = float(price) / 100.0
-        except (TypeError, ValueError):
+
+        except (
+            TypeError,
+            ValueError
+        ):
             continue
 
-        sale_id = (
-            sale.get("id")
-            or sale.get("sale_id")
-            or sale.get("contract_id")
-            or sale.get("listing_id")
-            or f"{sale.get('created_at', '')}|{price}"
-        )
+        sale_id = get_sale_id(sale)
 
         sales.append({
-            "id": str(sale_id),
+            "id": sale_id,
             "price_eur": price_eur,
             "created_at": (
                 sale.get("created_at")
@@ -94,14 +163,17 @@ def fetch_sales(name):
     response = requests.get(
         url,
         headers={
-            "User-Agent": "CSFloatPriceAlert-GitHubActions/1.0"
+            "User-Agent":
+                "CSFloatPriceAlert-GitHubActions/1.0"
         },
         timeout=30
     )
 
     response.raise_for_status()
 
-    return extract_sales(response.json())
+    return extract_sales(
+        response.json()
+    )
 
 
 def send_discord(
@@ -111,9 +183,15 @@ def send_discord(
     baseline,
     multiplier
 ):
-    above_median = sale["price_eur"] > baseline
+    above_median = (
+        sale["price_eur"] > baseline
+    )
 
-    mention = "@everyone\n" if above_median else ""
+    mention = (
+        "@everyone\n"
+        if above_median
+        else ""
+    )
 
     content = (
         f"{mention}"
@@ -126,27 +204,89 @@ def send_discord(
         f"market_hash_name={quote(name)}"
     )
 
-    response = requests.post(
-        webhook,
-        json={
-            "content": content,
-            "allowed_mentions": {
-                "parse": ["everyone"] if above_median else []
-            }
-        },
-        timeout=30
+    for attempt in range(5):
+
+        response = requests.post(
+            webhook,
+            json={
+                "content": content,
+                "allowed_mentions": {
+                    "parse": (
+                        ["everyone"]
+                        if above_median
+                        else []
+                    )
+                }
+            },
+            timeout=30
+        )
+
+        if response.status_code == 204:
+            return True
+
+        if response.status_code == 200:
+            return True
+
+        if response.status_code == 429:
+
+            retry_after = response.headers.get(
+                "Retry-After"
+            )
+
+            try:
+                wait_seconds = float(
+                    retry_after
+                )
+
+            except (
+                TypeError,
+                ValueError
+            ):
+                wait_seconds = 5.0
+
+            wait_seconds = max(
+                wait_seconds,
+                2.5
+            )
+
+            print(
+                f"[DISCORD] Rate limit. "
+                f"A aguardar {wait_seconds:.1f}s..."
+            )
+
+            time.sleep(
+                wait_seconds
+            )
+
+            continue
+
+        print(
+            f"[DISCORD ERROR] "
+            f"HTTP {response.status_code}: "
+            f"{response.text[:300]}"
+        )
+
+        return False
+
+    print(
+        "[DISCORD ERROR] "
+        "Não foi possível enviar após "
+        "várias tentativas."
     )
 
-    response.raise_for_status()
+    return False
 
 
 def main():
-    webhook = os.environ.get("DISCORD_WEBHOOK")
+
+    webhook = os.environ.get(
+        "DISCORD_WEBHOOK"
+    )
 
     if not webhook:
         raise SystemExit(
-            "DISCORD_WEBHOOK não está configurado "
-            "no GitHub Secrets."
+            "DISCORD_WEBHOOK não está "
+            "configurado no GitHub Secrets."
         )
 
     config = load_json(
@@ -159,27 +299,44 @@ def main():
         }
     )
 
-    state_exists = STATE_FILE.exists()
-
     state = load_json(
         STATE_FILE,
-        {"seen": {}}
+        {
+            "sent": {}
+        }
     )
 
-    for item in config.get("items", []):
+    # Compatibilidade com o estado antigo.
+    if "sent" not in state:
+        state["sent"] = {}
 
-        if not item.get("enabled", True):
+    for item in config.get(
+        "items",
+        []
+    ):
+
+        if not item.get(
+            "enabled",
+            True
+        ):
             continue
 
-        name = item["market_hash_name"]
+        name = item[
+            "market_hash_name"
+        ]
 
         rule = {
-            **config.get("default_rule", {}),
+            **config.get(
+                "default_rule",
+                {}
+            ),
             **item
         }
 
         try:
-            sales = fetch_sales(name)
+            sales = fetch_sales(
+                name
+            )
 
         except Exception as exc:
             print(
@@ -194,13 +351,21 @@ def main():
             )
             continue
 
-        # Primeira execução:
-        # guardar as vendas existentes sem notificações.
-        if (
-            not state_exists
-            or name not in state["seen"]
-        ):
-            state["seen"][name] = [
+        sent_ids = set(
+            state["sent"].get(
+                name,
+                []
+            )
+        )
+
+        # Primeira inicialização.
+        #
+        # Se nunca tivermos estado para este item,
+        # guardamos as vendas atuais sem enviar
+        # notificações antigas.
+        if name not in state["sent"]:
+
+            state["sent"][name] = [
                 sale["id"]
                 for sale in sales
             ][:500]
@@ -213,18 +378,34 @@ def main():
 
             continue
 
-        seen = set(
-            state["seen"][name]
-        )
-
-        new_sales = [
+        # Só processamos vendas que ainda não
+        # foram enviadas para o Discord.
+        pending_sales = [
             sale
             for sale in reversed(sales)
-            if sale["id"] not in seen
+            if sale["id"] not in sent_ids
         ]
 
-        for sale in new_sales:
+        print(
+            f"[CHECK] {name}: "
+            f"{len(sales)} vendas, "
+            f"{len(pending_sales)} pendentes."
+        )
 
+        if not pending_sales:
+            continue
+
+        # Limite de segurança por execução.
+        sales_to_process = (
+            pending_sales[
+                :MAX_SALES_PER_RUN
+            ]
+        )
+
+        for sale in sales_to_process:
+
+            # A mediana é calculada usando as outras
+            # vendas disponíveis.
             comparison = [
                 other["price_eur"]
                 for other in sales
@@ -237,6 +418,10 @@ def main():
             )]
 
             if not comparison:
+                print(
+                    f"[SKIP] {name}: "
+                    "sem dados suficientes."
+                )
                 continue
 
             baseline = statistics.median(
@@ -244,51 +429,63 @@ def main():
             )
 
             multiplier = (
-                sale["price_eur"] / baseline
+                sale["price_eur"]
+                / baseline
                 if baseline
                 else 0
             )
 
-            try:
-                send_discord(
-                    webhook,
-                    name,
-                    sale,
-                    baseline,
-                    multiplier
-                )
-
-                print(
-                    f"[SALE] {name}: "
-                    f"€{sale['price_eur']:.2f} "
-                    f"({multiplier:.2f}x)"
-                    + (
-                        " @everyone"
-                        if sale["price_eur"] > baseline
-                        else ""
-                    )
-                )
-
-            except Exception as exc:
-                print(
-                    f"[DISCORD ERROR] {exc}"
-                )
-
-        state["seen"][name] = list(
-            dict.fromkeys(
-                [
-                    sale["id"]
-                    for sale in sales
-                ]
-                + state["seen"][name]
+            print(
+                f"[SALE] {name}: "
+                f"€{sale['price_eur']:.2f} "
+                f"({multiplier:.2f}x)"
             )
-        )[:500]
 
-        print(
-            f"[OK] {name}: "
-            f"{len(sales)} vendas, "
-            f"{len(new_sales)} novas."
-        )
+            success = send_discord(
+                webhook,
+                name,
+                sale,
+                baseline,
+                multiplier
+            )
+
+            if success:
+
+                sent_ids.add(
+                    sale["id"]
+                )
+
+                state["sent"][name] = list(
+                    sent_ids
+                )[-500:]
+
+                save_json(
+                    STATE_FILE,
+                    state
+                )
+
+                if sale["price_eur"] > baseline:
+                    print(
+                        "[SENT] "
+                        "@everyone enviado."
+                    )
+                else:
+                    print(
+                        "[SENT] "
+                        "Notificação normal enviada."
+                    )
+
+            else:
+                print(
+                    "[PENDING] "
+                    "Venda não enviada. "
+                    "Será tentada novamente."
+                )
+
+            # Evita atingir o rate limit.
+            time.sleep(
+                DISCORD_DELAY_SECONDS
+            )
 
     save_json(
         STATE_FILE,
