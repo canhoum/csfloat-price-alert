@@ -13,12 +13,10 @@ STATE_FILE = Path("state.json")
 
 BASE_URL = "https://csfloat.com/api/v1/history/{}/sales"
 
-# Discord permite um número limitado de mensagens por minuto.
-# Mantemos um intervalo seguro entre mensagens.
+# Intervalo entre mensagens do Discord
 DISCORD_DELAY_SECONDS = 2.2
 
-# Se houver muitas vendas pendentes, não tentamos enviar todas
-# na mesma execução.
+# Limite de segurança de vendas processadas por execução
 MAX_SALES_PER_RUN = 20
 
 
@@ -44,8 +42,11 @@ def save_json(path, data):
 
 def get_sale_id(sale):
     """
-    Cria um identificador estável para uma venda.
+    Cria um identificador para uma venda.
+
     Preferimos o ID oficial da venda.
+    Se não existir, usamos uma combinação de
+    data + preço + asset.
     """
 
     for key in (
@@ -73,9 +74,9 @@ def get_sale_id(sale):
         )
     )
 
-    item = sale.get("item")
-
     asset_id = ""
+
+    item = sale.get("item")
 
     if isinstance(item, dict):
         asset_id = item.get(
@@ -91,10 +92,12 @@ def get_sale_id(sale):
 
 
 def extract_sales(payload):
+
     if isinstance(payload, list):
         raw = payload
 
     elif isinstance(payload, dict):
+
         raw = next(
             (
                 payload[key]
@@ -143,19 +146,24 @@ def extract_sales(payload):
 
         sale_id = get_sale_id(sale)
 
-        sales.append({
-            "id": sale_id,
-            "price_eur": price_eur,
-            "created_at": (
-                sale.get("created_at")
-                or sale.get("sold_at")
-            )
-        })
+        sales.append(
+            {
+                "id": sale_id,
+
+                "price_eur": price_eur,
+
+                "created_at": (
+                    sale.get("created_at")
+                    or sale.get("sold_at")
+                )
+            }
+        )
 
     return sales
 
 
 def fetch_sales(name):
+
     url = BASE_URL.format(
         quote(name, safe="")
     )
@@ -183,6 +191,7 @@ def send_discord(
     baseline,
     multiplier
 ):
+
     above_median = (
         sale["price_eur"] > baseline
     )
@@ -210,6 +219,7 @@ def send_discord(
             webhook,
             json={
                 "content": content,
+
                 "allowed_mentions": {
                     "parse": (
                         ["everyone"]
@@ -221,12 +231,14 @@ def send_discord(
             timeout=30
         )
 
-        if response.status_code == 204:
+        # Discord webhook enviado com sucesso
+        if response.status_code in (
+            200,
+            204
+        ):
             return True
 
-        if response.status_code == 200:
-            return True
-
+        # Rate limit do Discord
         if response.status_code == 429:
 
             retry_after = response.headers.get(
@@ -244,6 +256,7 @@ def send_discord(
             ):
                 wait_seconds = 5.0
 
+            # Segurança adicional
             wait_seconds = max(
                 wait_seconds,
                 2.5
@@ -251,7 +264,8 @@ def send_discord(
 
             print(
                 f"[DISCORD] Rate limit. "
-                f"A aguardar {wait_seconds:.1f}s..."
+                f"A aguardar "
+                f"{wait_seconds:.1f}s..."
             )
 
             time.sleep(
@@ -279,6 +293,10 @@ def send_discord(
 
 def main():
 
+    # --------------------------------------------------
+    # DISCORD WEBHOOK
+    # --------------------------------------------------
+
     webhook = os.environ.get(
         "DISCORD_WEBHOOK"
     )
@@ -288,6 +306,10 @@ def main():
             "DISCORD_WEBHOOK não está "
             "configurado no GitHub Secrets."
         )
+
+    # --------------------------------------------------
+    # CONFIGURAÇÃO
+    # --------------------------------------------------
 
     config = load_json(
         CONFIG_FILE,
@@ -299,19 +321,25 @@ def main():
         }
     )
 
-       state = load_json(
+    # --------------------------------------------------
+    # ESTADO
+    # --------------------------------------------------
+
+    state = load_json(
         STATE_FILE,
         {
             "sent": {}
         }
     )
 
-    # Compatibilidade com o estado antigo.
-    # A versão anterior guardava as vendas em "seen".
-    # Mantemos essas vendas para não as voltar a notificar.
+    # --------------------------------------------------
+    # COMPATIBILIDADE COM O ESTADO ANTIGO
+    # --------------------------------------------------
+
     if "sent" not in state:
 
         if "seen" in state:
+
             state["sent"] = state["seen"]
 
             print(
@@ -320,7 +348,18 @@ def main():
             )
 
         else:
+
             state["sent"] = {}
+
+    # --------------------------------------------------
+    # PROCESSAR ITEMS
+    # --------------------------------------------------
+
+    for item in config.get(
+        "items",
+        []
+    ):
+
         if not item.get(
             "enabled",
             True
@@ -339,23 +378,36 @@ def main():
             **item
         }
 
+        # --------------------------------------------------
+        # OBTER VENDAS DA CSFLOAT
+        # --------------------------------------------------
+
         try:
+
             sales = fetch_sales(
                 name
             )
 
         except Exception as exc:
+
             print(
                 f"[ERROR] {name}: {exc}"
             )
+
             continue
 
         if not sales:
+
             print(
                 f"[OK] {name}: "
                 "API não devolveu vendas."
             )
+
             continue
+
+        # --------------------------------------------------
+        # VENDAS JÁ PROCESSADAS
+        # --------------------------------------------------
 
         sent_ids = set(
             state["sent"].get(
@@ -364,11 +416,10 @@ def main():
             )
         )
 
-        # Primeira inicialização.
-        #
-        # Se nunca tivermos estado para este item,
-        # guardamos as vendas atuais sem enviar
-        # notificações antigas.
+        # --------------------------------------------------
+        # PRIMEIRA EXECUÇÃO
+        # --------------------------------------------------
+
         if name not in state["sent"]:
 
             state["sent"][name] = [
@@ -378,14 +429,16 @@ def main():
 
             print(
                 f"[INIT] {name}: "
-                f"{len(sales)} vendas registadas "
-                "sem alertas."
+                f"{len(sales)} vendas "
+                "registadas sem alertas."
             )
 
             continue
 
-        # Só processamos vendas que ainda não
-        # foram enviadas para o Discord.
+        # --------------------------------------------------
+        # DETETAR NOVAS VENDAS
+        # --------------------------------------------------
+
         pending_sales = [
             sale
             for sale in reversed(sales)
@@ -401,17 +454,26 @@ def main():
         if not pending_sales:
             continue
 
-        # Limite de segurança por execução.
+        # --------------------------------------------------
+        # LIMITE DE SEGURANÇA
+        # --------------------------------------------------
+
         sales_to_process = (
             pending_sales[
                 :MAX_SALES_PER_RUN
             ]
         )
 
+        # --------------------------------------------------
+        # PROCESSAR CADA VENDA
+        # --------------------------------------------------
+
         for sale in sales_to_process:
 
-            # A mediana é calculada usando as outras
-            # vendas disponíveis.
+            # --------------------------------------------------
+            # CALCULAR MEDIANA
+            # --------------------------------------------------
+
             comparison = [
                 other["price_eur"]
                 for other in sales
@@ -424,15 +486,22 @@ def main():
             )]
 
             if not comparison:
+
                 print(
                     f"[SKIP] {name}: "
-                    "sem dados suficientes."
+                    "sem dados suficientes "
+                    "para calcular a mediana."
                 )
+
                 continue
 
             baseline = statistics.median(
                 comparison
             )
+
+            # --------------------------------------------------
+            # CALCULAR DIFERENÇA
+            # --------------------------------------------------
 
             multiplier = (
                 sale["price_eur"]
@@ -447,6 +516,10 @@ def main():
                 f"({multiplier:.2f}x)"
             )
 
+            # --------------------------------------------------
+            # ENVIAR PARA DISCORD
+            # --------------------------------------------------
+
             success = send_discord(
                 webhook,
                 name,
@@ -454,6 +527,10 @@ def main():
                 baseline,
                 multiplier
             )
+
+            # --------------------------------------------------
+            # SE ENVIOU COM SUCESSO
+            # --------------------------------------------------
 
             if success:
 
@@ -465,33 +542,51 @@ def main():
                     sent_ids
                 )[-500:]
 
+                # Guardar imediatamente.
+                # Assim, se o GitHub parar a execução,
+                # não perdemos as vendas já notificadas.
                 save_json(
                     STATE_FILE,
                     state
                 )
 
                 if sale["price_eur"] > baseline:
+
                     print(
                         "[SENT] "
                         "@everyone enviado."
                     )
+
                 else:
+
                     print(
                         "[SENT] "
                         "Notificação normal enviada."
                     )
 
+            # --------------------------------------------------
+            # SE FALHOU
+            # --------------------------------------------------
+
             else:
+
                 print(
                     "[PENDING] "
                     "Venda não enviada. "
                     "Será tentada novamente."
                 )
 
-            # Evita atingir o rate limit.
+            # --------------------------------------------------
+            # ESPERA ENTRE MENSAGENS
+            # --------------------------------------------------
+
             time.sleep(
                 DISCORD_DELAY_SECONDS
             )
+
+    # --------------------------------------------------
+    # GUARDAR ESTADO FINAL
+    # --------------------------------------------------
 
     save_json(
         STATE_FILE,
