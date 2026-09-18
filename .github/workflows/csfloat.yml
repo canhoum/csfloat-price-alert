@@ -29,15 +29,15 @@ jobs:
           restore-keys: |
             csfloat-state-
 
-    - name: Show state status
-      run: |
-        echo "Cache hit: ${{ steps.restore-state.outputs.cache-hit }}"
-        if [ -f state.json ]; then
-          echo "state.json encontrado:"
-          cat state.json
-        else
-          echo "state.json NÃO encontrado."
-        fi
+      - name: Show state status
+        run: |
+          echo "Cache hit: ${{ steps.restore-state.outputs.cache-hit }}"
+          if [ -f state.json ]; then
+            echo "state.json encontrado:"
+            cat state.json
+          else
+            echo "state.json NÃO encontrado."
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
