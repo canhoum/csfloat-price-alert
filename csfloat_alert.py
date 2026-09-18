@@ -14,191 +14,84 @@ STATE_FILE = Path("state.json")
 BASE_URL = "https://csfloat.com/api/v1/history/{}/sales"
 
 DISCORD_DELAY_SECONDS = 2.2
-
-STATE_VERSION = 3
-
-MAX_STORED_SALES = 500
+MAX_STORED_SALES = 200
+STATE_VERSION = 4
 
 
 def load_json(path, default):
     if not path.exists():
         return default
 
-    return json.loads(
-        path.read_text(encoding="utf-8")
-    )
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
 
 
 def save_json(path, data):
     path.write_text(
-        json.dumps(
-            data,
-            indent=2,
-            ensure_ascii=False
-        ),
+        json.dumps(data, indent=2, ensure_ascii=False),
         encoding="utf-8"
     )
 
 
-def get_asset_id(sale):
-    item = sale.get("item")
+def get_sale_id(sale):
+    """
+    O ID da própria venda é o identificador mais seguro.
+    """
+    value = sale.get("id")
 
-    if isinstance(item, dict):
-        return str(
-            item.get("asset_id", "")
-        )
+    if value is not None:
+        return str(value)
 
     return ""
 
 
-def get_sale_key(sale):
-    """
-    Cria um identificador estável para uma venda.
-
-    Usamos:
-        created_at
-        sold_at
-        price
-        asset_id
-
-    O ID da venda é usado apenas como fallback.
-    """
-
-    created_at = (
-        sale.get("created_at")
-        or ""
-    )
-
-    sold_at = (
-        sale.get("sold_at")
-        or ""
-    )
-
-    price = sale.get(
-        "price",
-        sale.get(
-            "sale_price",
-            sale.get("amount", "")
-        )
-    )
-
-    asset_id = get_asset_id(
-        sale
-    )
-
-    # Fingerprint estável
-    if created_at or sold_at or asset_id:
-
-        return (
-            f"fp|"
-            f"{created_at}|"
-            f"{sold_at}|"
-            f"{price}|"
-            f"{asset_id}"
-        )
-
-    # Fallback
-    for key in (
-        "id",
-        "sale_id",
-        "contract_id",
-        "listing_id"
-    ):
-        value = sale.get(key)
-
-        if value:
-            return f"id|{value}"
-
-    return (
-        f"fallback|"
-        f"{price}"
-    )
-
-
 def extract_sales(payload):
-
     if isinstance(payload, list):
-
-        raw = payload
+        raw_sales = payload
 
     elif isinstance(payload, dict):
-
-        raw = next(
+        raw_sales = next(
             (
                 payload[key]
-                for key in (
-                    "sales",
-                    "data",
-                    "results"
-                )
-                if isinstance(
-                    payload.get(key),
-                    list
-                )
+                for key in ("sales", "data", "results")
+                if isinstance(payload.get(key), list)
             ),
             []
         )
 
     else:
-
-        raw = []
+        raw_sales = []
 
     sales = []
 
-    for sale in raw:
-
-        if not isinstance(
-            sale,
-            dict
-        ):
+    for sale in raw_sales:
+        if not isinstance(sale, dict):
             continue
 
-        price = sale.get(
-            "price",
-            sale.get(
-                "sale_price",
-                sale.get("amount")
-            )
-        )
+        sale_id = get_sale_id(sale)
+
+        if not sale_id:
+            continue
+
+        price = sale.get("price")
 
         if price is None:
             continue
 
         try:
-
-            price_eur = (
-                float(price) / 100.0
-            )
-
-        except (
-            TypeError,
-            ValueError
-        ):
+            price_usd = float(price) / 100.0
+        except (TypeError, ValueError):
             continue
+
+        sold_at = sale.get("sold_at") or sale.get("created_at") or ""
 
         sales.append(
             {
-                "key": get_sale_key(
-                    sale
-                ),
-
-                "id": str(
-                    sale.get(
-                        "id",
-                        ""
-                    )
-                ),
-
-                "price_eur": price_eur,
-
-                "created_at": (
-                    sale.get(
-                        "created_at"
-                    )
-                    or sale.get(
-                        "sold_at"
-                    )
-                )
+                "id": sale_id,
+                "price_usd": price_usd,
+                "sold_at": sold_at,
             }
         )
 
@@ -208,47 +101,39 @@ def extract_sales(payload):
 def fetch_sales(name):
     url = BASE_URL.format(quote(name, safe=""))
 
-    print(f"[API URL] {url}")
-
     response = requests.get(
         url,
-        headers={"User-Agent":"CSFloatPriceAlert-GitHubActions/1.0"},
+        headers={
+            "User-Agent": "CSFloatPriceAlert-GitHubActions/1.0"
+        },
         timeout=30
     )
 
-    print(f"[API STATUS] {response.status_code}")
-    print(f"[API RESPONSE] {response.text[:3000]}")
-
     response.raise_for_status()
+
     return extract_sales(response.json())
 
 
-def send_discord(
-    webhook,
-    name,
-    sale,
-    baseline,
-    multiplier
-):
+def send_discord(webhook, name, sale, baseline):
+    price = sale["price_usd"]
 
-    above_median = (
-        sale["price_eur"]
-        > baseline
-    )
+    above_median = price > baseline
 
-    mention = (
-        "@everyone\n"
-        if above_median
-        else ""
+    mention = "@everyone\n" if above_median else ""
+
+    difference = (
+        price / baseline
+        if baseline > 0
+        else 0
     )
 
     content = (
         f"{mention}"
-        "**CSFloat SALE**\n"
+        f"**CSFloat SALE**\n"
         f"Item: `{name}`\n"
-        f"Sale: **€{sale['price_eur']:.2f}**\n"
-        f"Median baseline: €{baseline:.2f}\n"
-        f"Difference: **{multiplier:.2f}×**\n"
+        f"Sale: **${price:.2f}**\n"
+        f"Median baseline: ${baseline:.2f}\n"
+        f"Difference: **{difference:.2f}×**\n"
         f"CSFloat: https://csfloat.com/search?"
         f"market_hash_name={quote(name)}"
     )
@@ -259,60 +144,35 @@ def send_discord(
             webhook,
             json={
                 "content": content,
-
                 "allowed_mentions": {
-                    "parse": (
-                        ["everyone"]
-                        if above_median
-                        else []
-                    )
+                    "parse": ["everyone"]
+                    if above_median
+                    else []
                 }
             },
             timeout=30
         )
 
-        if response.status_code in (
-            200,
-            204
-        ):
+        if response.status_code in (200, 204):
             return True
 
         if response.status_code == 429:
 
-            retry_after = (
-                response.headers.get(
-                    "Retry-After"
-                )
-            )
+            retry_after = response.headers.get("Retry-After")
 
             try:
-
-                wait_seconds = float(
-                    retry_after
-                )
-
-            except (
-                TypeError,
-                ValueError
-            ):
-
+                wait_seconds = float(retry_after)
+            except (TypeError, ValueError):
                 wait_seconds = 5.0
 
-            wait_seconds = max(
-                wait_seconds,
-                2.5
-            )
+            wait_seconds = max(wait_seconds, 2.5)
 
             print(
                 f"[DISCORD] Rate limit. "
-                f"A aguardar "
-                f"{wait_seconds:.1f}s..."
+                f"A aguardar {wait_seconds:.1f}s..."
             )
 
-            time.sleep(
-                wait_seconds
-            )
-
+            time.sleep(wait_seconds)
             continue
 
         print(
@@ -325,8 +185,7 @@ def send_discord(
 
     print(
         "[DISCORD ERROR] "
-        "Não foi possível enviar após "
-        "várias tentativas."
+        "Não foi possível enviar após várias tentativas."
     )
 
     return False
@@ -334,24 +193,13 @@ def send_discord(
 
 def main():
 
-    # ==================================================
-    # DISCORD
-    # ==================================================
-
-    webhook = os.environ.get(
-        "DISCORD_WEBHOOK"
-    )
+    webhook = os.environ.get("DISCORD_WEBHOOK")
 
     if not webhook:
-
         raise SystemExit(
-            "DISCORD_WEBHOOK não está "
-            "configurado no GitHub Secrets."
+            "DISCORD_WEBHOOK não está configurado "
+            "nos GitHub Secrets."
         )
-
-    # ==================================================
-    # CONFIG
-    # ==================================================
 
     config = load_json(
         CONFIG_FILE,
@@ -363,75 +211,58 @@ def main():
         }
     )
 
-    # ==================================================
-    # STATE
-    # ==================================================
+    state = load_json(STATE_FILE, {})
 
-    state = load_json(
-        STATE_FILE,
-        {}
+    # ---------------------------------------------------------
+    # PRIMEIRO ARRANQUE / ESTADO INVÁLIDO
+    # ---------------------------------------------------------
+
+    valid_state = (
+        isinstance(state, dict)
+        and state.get("version") == STATE_VERSION
+        and isinstance(state.get("seen"), dict)
     )
 
-    old_state = state
-
-    # ==================================================
-    # DETETAR SE PRECISAMOS DE REINICIALIZAR
-    # ==================================================
-
-    needs_reinitialization = (
-        state.get(
-            "version"
-        ) != STATE_VERSION
-    )
-
-    if needs_reinitialization:
+    if not valid_state:
 
         print(
-            "[RESET] A criar novo estado "
-            "com identificadores estáveis."
+            "[RESET] Estado inexistente ou incompatível."
         )
 
         state = {
             "version": STATE_VERSION,
-            "sent": {}
+            "seen": {}
         }
 
-    # ==================================================
-    # ITEMS
-    # ==================================================
+        first_run = True
 
-    for item in config.get(
-        "items",
-        []
-    ):
+    else:
 
-        if not item.get(
-            "enabled",
-            True
-        ):
+        first_run = False
+
+    # ---------------------------------------------------------
+    # PROCESSAR ITEMS
+    # ---------------------------------------------------------
+
+    for item in config.get("items", []):
+
+        if not item.get("enabled", True):
             continue
 
-        name = item[
-            "market_hash_name"
-        ]
+        name = item["market_hash_name"]
 
         rule = {
-            **config.get(
-                "default_rule",
-                {}
-            ),
+            **config.get("default_rule", {}),
             **item
         }
 
-        # ==================================================
-        # OBTER VENDAS
-        # ==================================================
+        baseline_count = int(
+            rule.get("baseline_sales", 100)
+        )
 
         try:
 
-            sales = fetch_sales(
-                name
-            )
+            sales = fetch_sales(name)
 
         except Exception as exc:
 
@@ -450,192 +281,133 @@ def main():
 
             continue
 
-        # ==================================================
-        # PRIMEIRA EXECUÇÃO DA NOVA VERSÃO
-        # ==================================================
+        print(
+            f"[API] {name}: "
+            f"{len(sales)} vendas recebidas."
+        )
 
-        #
-        # IMPORTANTE:
-        #
-        # As 40 vendas que estão atualmente na API
-        # serão usadas como baseline.
-        #
-        # NÃO serão enviadas para o Discord.
-        #
+        # -----------------------------------------------------
+        # PRIMEIRO ARRANQUE
+        # -----------------------------------------------------
 
-        if needs_reinitialization:
+        if first_run:
 
-            state["sent"][name] = [
-                sale["key"]
-                for sale in sales
-            ][
-                :MAX_STORED_SALES
+            state["seen"][name] = [
+                sale["id"]
+                for sale in sales[:MAX_STORED_SALES]
             ]
 
             print(
-                f"[RESET] {name}: "
-                f"{len(sales)} vendas "
-                "registadas como existentes. "
-                "Nenhum alerta enviado."
+                f"[BASELINE] {name}: "
+                f"{len(sales)} vendas registadas."
+            )
+
+            print(
+                "[BASELINE] "
+                "Nenhuma notificação enviada."
             )
 
             continue
 
-        # ==================================================
-        # VENDAS JÁ ENVIADAS
-        # ==================================================
+        # -----------------------------------------------------
+        # DETETAR NOVAS VENDAS
+        # -----------------------------------------------------
 
-        sent_keys = set(
-            state.get(
-                "sent",
-                {}
-            ).get(
-                name,
-                []
-            )
+        seen_ids = set(
+            state["seen"].get(name, [])
         )
 
-        # ==================================================
-        # NOVAS VENDAS
-        # ==================================================
-
-        pending_sales = [
+        new_sales = [
             sale
-            for sale in reversed(
-                sales
-            )
-            if sale["key"]
-            not in sent_keys
+            for sale in reversed(sales)
+            if sale["id"] not in seen_ids
         ]
 
         print(
             f"[CHECK] {name}: "
             f"{len(sales)} vendas, "
-            f"{len(pending_sales)} novas."
+            f"{len(new_sales)} novas."
         )
 
-        if not pending_sales:
-
+        if not new_sales:
             continue
 
-        # ==================================================
-        # PROCESSAR NOVAS VENDAS
-        # ==================================================
+        # -----------------------------------------------------
+        # MEDIANA
+        # -----------------------------------------------------
 
-        for sale in pending_sales:
+        all_prices = [
+            sale["price_usd"]
+            for sale in sales
+        ]
 
-            # --------------------------------------------------
-            # MEDIANA
-            # --------------------------------------------------
+        # Excluir a nova venda da própria referência
+        # para não influenciar a mediana.
+        for sale in new_sales:
 
-            comparison = [
-                other["price_eur"]
+            comparison_prices = [
+                other["price_usd"]
                 for other in sales
-                if other["key"]
-                != sale["key"]
-            ][:int(
-                rule.get(
-                    "baseline_sales",
-                    100
-                )
-            )]
+                if other["id"] != sale["id"]
+            ]
 
-            if not comparison:
+            comparison_prices = comparison_prices[
+                :baseline_count
+            ]
+
+            if not comparison_prices:
 
                 print(
                     f"[SKIP] {name}: "
-                    "sem dados suficientes "
-                    "para calcular a mediana."
+                    "sem dados suficientes."
                 )
 
                 continue
 
             baseline = statistics.median(
-                comparison
-            )
-
-            # --------------------------------------------------
-            # MULTIPLICADOR
-            # --------------------------------------------------
-
-            multiplier = (
-                sale["price_eur"]
-                / baseline
-                if baseline
-                else 0
+                comparison_prices
             )
 
             print(
                 f"[SALE] {name}: "
-                f"€{sale['price_eur']:.2f} "
-                f"({multiplier:.2f}x)"
+                f"${sale['price_usd']:.2f} "
+                f"(mediana ${baseline:.2f})"
             )
-
-            # --------------------------------------------------
-            # DISCORD
-            # --------------------------------------------------
 
             success = send_discord(
                 webhook,
                 name,
                 sale,
-                baseline,
-                multiplier
+                baseline
             )
 
             if success:
 
-                sent_keys.add(
-                    sale["key"]
+                seen_ids.add(sale["id"])
+
+                print(
+                    "[SENT] "
+                    "Notificação enviada."
                 )
-
-                state["sent"][name] = list(
-                    sent_keys
-                )[
-                    -MAX_STORED_SALES:
-                ]
-
-                save_json(
-                    STATE_FILE,
-                    state
-                )
-
-                if (
-                    sale["price_eur"]
-                    > baseline
-                ):
-
-                    print(
-                        "[SENT] "
-                        "@everyone enviado."
-                    )
-
-                else:
-
-                    print(
-                        "[SENT] "
-                        "Notificação normal enviada."
-                    )
 
             else:
 
                 print(
                     "[PENDING] "
-                    "Venda não enviada. "
-                    "Será tentada novamente."
+                    "Venda não enviada."
                 )
-
-            # --------------------------------------------------
-            # DELAY
-            # --------------------------------------------------
 
             time.sleep(
                 DISCORD_DELAY_SECONDS
             )
 
-    # ==================================================
-    # GUARDAR ESTADO
-    # ==================================================
+        # -----------------------------------------------------
+        # GUARDAR ESTADO
+        # -----------------------------------------------------
+
+        state["seen"][name] = list(seen_ids)[
+            -MAX_STORED_SALES:
+        ]
 
     save_json(
         STATE_FILE,
