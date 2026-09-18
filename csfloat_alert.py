@@ -206,28 +206,21 @@ def extract_sales(payload):
 
 
 def fetch_sales(name):
+    url = BASE_URL.format(quote(name, safe=""))
 
-    url = BASE_URL.format(
-        quote(
-            name,
-            safe=""
-        )
-    )
+    print(f"[API URL] {url}")
 
     response = requests.get(
         url,
-        headers={
-            "User-Agent":
-                "CSFloatPriceAlert-GitHubActions/1.0"
-        },
+        headers={"User-Agent":"CSFloatPriceAlert-GitHubActions/1.0"},
         timeout=30
     )
 
-    response.raise_for_status()
+    print(f"[API STATUS] {response.status_code}")
+    print(f"[API RESPONSE] {response.text[:3000]}")
 
-    return extract_sales(
-        response.json()
-    )
+    response.raise_for_status()
+    return extract_sales(response.json())
 
 
 def send_discord(
