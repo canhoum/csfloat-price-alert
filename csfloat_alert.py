@@ -12,10 +12,17 @@ CONFIG_FILE = Path("config.json")
 STATE_FILE = Path("state.json")
 
 BASE_URL = "https://csfloat.com/api/v1/history/{}/sales"
+EXCHANGE_URL = "https://csfloat.com/api/v1/meta/exchange-rates"
 
 DISCORD_DELAY_SECONDS = 2.2
+
+# Guardamos IDs suficientes para evitar duplicações.
 MAX_STORED_SALES = 200
-STATE_VERSION = 4
+
+# Número de vendas usadas para calcular a mediana.
+BASELINE_SALES = 100
+
+STATE_VERSION = 5
 
 
 def load_json(path, default):
@@ -36,15 +43,12 @@ def save_json(path, data):
 
 
 def get_sale_id(sale):
-    """
-    O ID da própria venda é o identificador mais seguro.
-    """
     value = sale.get("id")
 
-    if value is not None:
-        return str(value)
+    if value is None:
+        return ""
 
-    return ""
+    return str(value)
 
 
 def extract_sales(payload):
@@ -81,11 +85,16 @@ def extract_sales(payload):
             continue
 
         try:
+            # CSFloat devolve o preço em cêntimos de USD.
             price_usd = float(price) / 100.0
         except (TypeError, ValueError):
             continue
 
-        sold_at = sale.get("sold_at") or sale.get("created_at") or ""
+        sold_at = (
+            sale.get("sold_at")
+            or sale.get("created_at")
+            or ""
+        )
 
         sales.append(
             {
@@ -99,7 +108,11 @@ def extract_sales(payload):
 
 
 def fetch_sales(name):
-    url = BASE_URL.format(quote(name, safe=""))
+    url = BASE_URL.format(
+        quote(name, safe="")
+    )
+
+    print(f"[API URL] {url}")
 
     response = requests.get(
         url,
@@ -109,30 +122,110 @@ def fetch_sales(name):
         timeout=30
     )
 
+    print(f"[API STATUS] {response.status_code}")
+
     response.raise_for_status()
 
-    return extract_sales(response.json())
+    sales = extract_sales(response.json())
+
+    print(f"[API] {name}: {len(sales)} vendas recebidas.")
+
+    return sales
 
 
-def send_discord(webhook, name, sale, baseline):
-    price = sale["price_usd"]
+def fetch_usd_to_eur():
+    """
+    Obtém a taxa USD -> EUR através do endpoint público
+    de exchange rates do CSFloat.
 
-    above_median = price > baseline
+    Se não for possível obter a taxa, usamos 1.0 como
+    fallback para não impedir as notificações.
+    """
 
-    mention = "@everyone\n" if above_median else ""
+    try:
+        response = requests.get(
+            EXCHANGE_URL,
+            headers={
+                "User-Agent": "CSFloatPriceAlert-GitHubActions/1.0"
+            },
+            timeout=15
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        print(f"[EXCHANGE] Resposta: {data}")
+
+        # Tentativas para diferentes formatos possíveis.
+        candidates = []
+
+        if isinstance(data, dict):
+            candidates.extend(
+                [
+                    data.get("EUR"),
+                    data.get("eur"),
+                    data.get("USD_EUR"),
+                    data.get("usd_eur"),
+                ]
+            )
+
+            rates = data.get("rates")
+
+            if isinstance(rates, dict):
+                candidates.extend(
+                    [
+                        rates.get("EUR"),
+                        rates.get("eur"),
+                    ]
+                )
+
+        for value in candidates:
+            try:
+                rate = float(value)
+
+                if rate > 0:
+                    print(f"[EXCHANGE] USD -> EUR: {rate}")
+                    return rate
+
+            except (TypeError, ValueError):
+                continue
+
+    except Exception as exc:
+        print(f"[EXCHANGE ERROR] {exc}")
+
+    print("[EXCHANGE] Não foi possível obter a taxa. Usar 1.0.")
+    return 1.0
+
+
+def send_discord(
+    webhook,
+    name,
+    sale,
+    baseline_usd,
+    usd_to_eur
+):
+    price_usd = sale["price_usd"]
+
+    baseline_eur = baseline_usd * usd_to_eur
+    price_eur = price_usd * usd_to_eur
+
+    above_median = price_usd > baseline_usd
 
     difference = (
-        price / baseline
-        if baseline > 0
+        price_usd / baseline_usd
+        if baseline_usd > 0
         else 0
     )
+
+    mention = "@everyone\n" if above_median else ""
 
     content = (
         f"{mention}"
         f"**CSFloat SALE**\n"
         f"Item: `{name}`\n"
-        f"Sale: **${price:.2f}**\n"
-        f"Median baseline: ${baseline:.2f}\n"
+        f"Sale: **€{price_eur:.2f}**\n"
+        f"Median baseline: €{baseline_eur:.2f}\n"
         f"Difference: **{difference:.2f}×**\n"
         f"CSFloat: https://csfloat.com/search?"
         f"market_hash_name={quote(name)}"
@@ -140,32 +233,48 @@ def send_discord(webhook, name, sale, baseline):
 
     for attempt in range(5):
 
-        response = requests.post(
-            webhook,
-            json={
-                "content": content,
-                "allowed_mentions": {
-                    "parse": ["everyone"]
-                    if above_median
-                    else []
-                }
-            },
-            timeout=30
-        )
+        try:
+            response = requests.post(
+                webhook,
+                json={
+                    "content": content,
+                    "allowed_mentions": {
+                        "parse": (
+                            ["everyone"]
+                            if above_median
+                            else []
+                        )
+                    }
+                },
+                timeout=30
+            )
+
+        except Exception as exc:
+            print(
+                f"[DISCORD ERROR] Tentativa {attempt + 1}: {exc}"
+            )
+
+            time.sleep(5)
+            continue
 
         if response.status_code in (200, 204):
             return True
 
         if response.status_code == 429:
 
-            retry_after = response.headers.get("Retry-After")
+            retry_after = response.headers.get(
+                "Retry-After"
+            )
 
             try:
                 wait_seconds = float(retry_after)
             except (TypeError, ValueError):
                 wait_seconds = 5.0
 
-            wait_seconds = max(wait_seconds, 2.5)
+            wait_seconds = max(
+                wait_seconds,
+                2.5
+            )
 
             print(
                 f"[DISCORD] Rate limit. "
@@ -173,6 +282,7 @@ def send_discord(webhook, name, sale, baseline):
             )
 
             time.sleep(wait_seconds)
+
             continue
 
         print(
@@ -191,6 +301,26 @@ def send_discord(webhook, name, sale, baseline):
     return False
 
 
+def add_seen_id(seen_list, sale_id):
+    """
+    Adiciona o ID mantendo a ordem.
+
+    IMPORTANTE:
+    Não usamos set() para guardar o estado final,
+    porque isso destrói a ordem dos IDs.
+    """
+
+    if sale_id in seen_list:
+        return seen_list
+
+    seen_list.append(sale_id)
+
+    if len(seen_list) > MAX_STORED_SALES:
+        seen_list = seen_list[-MAX_STORED_SALES:]
+
+    return seen_list
+
+
 def main():
 
     webhook = os.environ.get("DISCORD_WEBHOOK")
@@ -205,17 +335,16 @@ def main():
         CONFIG_FILE,
         {
             "default_rule": {
-                "baseline_sales": 100
+                "baseline_sales": BASELINE_SALES
             },
             "items": []
         }
     )
 
-    state = load_json(STATE_FILE, {})
-
-    # ---------------------------------------------------------
-    # PRIMEIRO ARRANQUE / ESTADO INVÁLIDO
-    # ---------------------------------------------------------
+    state = load_json(
+        STATE_FILE,
+        {}
+    )
 
     valid_state = (
         isinstance(state, dict)
@@ -240,9 +369,7 @@ def main():
 
         first_run = False
 
-    # ---------------------------------------------------------
-    # PROCESSAR ITEMS
-    # ---------------------------------------------------------
+    usd_to_eur = fetch_usd_to_eur()
 
     for item in config.get("items", []):
 
@@ -257,7 +384,10 @@ def main():
         }
 
         baseline_count = int(
-            rule.get("baseline_sales", 100)
+            rule.get(
+                "baseline_sales",
+                BASELINE_SALES
+            )
         )
 
         try:
@@ -276,19 +406,14 @@ def main():
 
             print(
                 f"[OK] {name}: "
-                "API não devolveu vendas."
+                f"API não devolveu vendas."
             )
 
             continue
 
-        print(
-            f"[API] {name}: "
-            f"{len(sales)} vendas recebidas."
-        )
-
-        # -----------------------------------------------------
-        # PRIMEIRO ARRANQUE
-        # -----------------------------------------------------
+        # --------------------------------------------------
+        # PRIMEIRA EXECUÇÃO
+        # --------------------------------------------------
 
         if first_run:
 
@@ -309,13 +434,30 @@ def main():
 
             continue
 
-        # -----------------------------------------------------
-        # DETETAR NOVAS VENDAS
-        # -----------------------------------------------------
+        # --------------------------------------------------
+        # ESTADO ANTERIOR
+        # --------------------------------------------------
 
-        seen_ids = set(
-            state["seen"].get(name, [])
+        seen_ids = state["seen"].get(
+            name,
+            []
         )
+
+        if not isinstance(seen_ids, list):
+            seen_ids = []
+
+        # Garantir que não existem duplicados
+        # mas preservar a ordem.
+        seen_ids = list(
+            dict.fromkeys(
+                str(value)
+                for value in seen_ids
+            )
+        )
+
+        # --------------------------------------------------
+        # DETETAR NOVAS VENDAS
+        # --------------------------------------------------
 
         new_sales = [
             sale
@@ -332,17 +474,10 @@ def main():
         if not new_sales:
             continue
 
-        # -----------------------------------------------------
-        # MEDIANA
-        # -----------------------------------------------------
+        # --------------------------------------------------
+        # PROCESSAR CADA VENDA NOVA
+        # --------------------------------------------------
 
-        all_prices = [
-            sale["price_usd"]
-            for sale in sales
-        ]
-
-        # Excluir a nova venda da própria referência
-        # para não influenciar a mediana.
         for sale in new_sales:
 
             comparison_prices = [
@@ -351,9 +486,9 @@ def main():
                 if other["id"] != sale["id"]
             ]
 
-            comparison_prices = comparison_prices[
-                :baseline_count
-            ]
+            comparison_prices = (
+                comparison_prices[:baseline_count]
+            )
 
             if not comparison_prices:
 
@@ -362,50 +497,72 @@ def main():
                     "sem dados suficientes."
                 )
 
+                # Mesmo assim registamos o ID para
+                # não o processar repetidamente.
+                seen_ids = add_seen_id(
+                    seen_ids,
+                    sale["id"]
+                )
+
                 continue
 
-            baseline = statistics.median(
+            baseline_usd = statistics.median(
                 comparison_prices
+            )
+
+            price_eur = (
+                sale["price_usd"]
+                * usd_to_eur
+            )
+
+            baseline_eur = (
+                baseline_usd
+                * usd_to_eur
             )
 
             print(
                 f"[SALE] {name}: "
-                f"${sale['price_usd']:.2f} "
-                f"(mediana ${baseline:.2f})"
+                f"€{price_eur:.2f} "
+                f"(mediana €{baseline_eur:.2f})"
             )
 
             success = send_discord(
                 webhook,
                 name,
                 sale,
-                baseline
+                baseline_usd,
+                usd_to_eur
             )
 
             if success:
 
-                seen_ids.add(sale["id"])
+                seen_ids = add_seen_id(
+                    seen_ids,
+                    sale["id"]
+                )
 
                 print(
-                    "[SENT] "
-                    "Notificação enviada."
+                    f"[SENT] "
+                    f"Venda {sale['id']} enviada."
                 )
 
             else:
 
                 print(
-                    "[PENDING] "
-                    "Venda não enviada."
+                    f"[PENDING] "
+                    f"Venda {sale['id']} "
+                    f"não enviada."
                 )
 
             time.sleep(
                 DISCORD_DELAY_SECONDS
             )
 
-        # -----------------------------------------------------
+        # --------------------------------------------------
         # GUARDAR ESTADO
-        # -----------------------------------------------------
+        # --------------------------------------------------
 
-        state["seen"][name] = list(seen_ids)[
+        state["seen"][name] = seen_ids[
             -MAX_STORED_SALES:
         ]
 
@@ -413,6 +570,8 @@ def main():
         STATE_FILE,
         state
     )
+
+    print("[STATE] Estado guardado.")
 
 
 if __name__ == "__main__":
