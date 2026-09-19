@@ -3,6 +3,7 @@ name: CSFloat Price Alerts
 on:
   schedule:
     - cron: "*/5 * * * *"
+
   workflow_dispatch:
 
 concurrency:
@@ -13,10 +14,13 @@ permissions:
   contents: read
 
 jobs:
+
   monitor:
+
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -32,6 +36,7 @@ jobs:
       - name: Show state status
         run: |
           echo "Cache hit: ${{ steps.restore-state.outputs.cache-hit }}"
+
           if [ -f state.json ]; then
             echo "state.json encontrado:"
             cat state.json
@@ -45,12 +50,15 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
       - name: Check CSFloat
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: python csfloat_alert.py
+        run: |
+          python csfloat_alert.py
 
       - name: Save current state
         uses: actions/cache/save@v4
