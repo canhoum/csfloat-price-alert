@@ -135,11 +135,8 @@ def fetch_sales(name):
 
 def fetch_usd_to_eur():
     """
-    Obtém a taxa USD -> EUR através do endpoint público
-    de exchange rates do CSFloat.
-
-    Se não for possível obter a taxa, usamos 1.0 como
-    fallback para não impedir as notificações.
+    Obtém a taxa USD -> EUR através do endpoint
+    público de exchange rates do CSFloat.
     """
 
     try:
@@ -157,41 +154,41 @@ def fetch_usd_to_eur():
 
         print(f"[EXCHANGE] Resposta: {data}")
 
-        # Tentativas para diferentes formatos possíveis.
-        candidates = []
+        # O CSFloat devolve atualmente as taxas dentro de "data".
+        rates = data.get("data", data)
 
-        if isinstance(data, dict):
-            candidates.extend(
-                [
-                    data.get("EUR"),
-                    data.get("eur"),
-                    data.get("USD_EUR"),
-                    data.get("usd_eur"),
-                ]
-            )
+        if isinstance(rates, dict):
 
-            rates = data.get("rates")
+            # EUR é a taxa que precisamos.
+            for key in ("eur", "EUR"):
 
-            if isinstance(rates, dict):
-                candidates.extend(
-                    [
-                        rates.get("EUR"),
-                        rates.get("eur"),
-                    ]
-                )
+                value = rates.get(key)
 
-        for value in candidates:
-            try:
-                rate = float(value)
+                try:
+                    rate = float(value)
 
-                if rate > 0:
-                    print(f"[EXCHANGE] USD -> EUR: {rate}")
-                    return rate
+                    if rate > 0:
+                        print(
+                            f"[EXCHANGE] USD -> EUR: {rate}"
+                        )
 
-            except (TypeError, ValueError):
-                continue
+                        return rate
+
+                except (TypeError, ValueError):
+                    continue
+
+        print(
+            "[EXCHANGE] "
+            "Taxa EUR não encontrada. Usar 1.0."
+        )
 
     except Exception as exc:
+
+        print(
+            f"[EXCHANGE ERROR] {exc}"
+        )
+
+    return 1.0    except Exception as exc:
         print(f"[EXCHANGE ERROR] {exc}")
 
     print("[EXCHANGE] Não foi possível obter a taxa. Usar 1.0.")
