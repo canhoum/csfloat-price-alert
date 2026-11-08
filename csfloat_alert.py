@@ -149,46 +149,29 @@ def fetch_usd_to_eur():
         )
 
         response.raise_for_status()
-
         data = response.json()
 
         print(f"[EXCHANGE] Resposta: {data}")
 
-        # O CSFloat devolve atualmente as taxas dentro de "data".
         rates = data.get("data", data)
 
         if isinstance(rates, dict):
-
-            # EUR é a taxa que precisamos.
             for key in ("eur", "EUR"):
-
                 value = rates.get(key)
 
                 try:
                     rate = float(value)
 
                     if rate > 0:
-                        print(
-                            f"[EXCHANGE] USD -> EUR: {rate}"
-                        )
-
+                        print(f"[EXCHANGE] USD -> EUR: {rate}")
                         return rate
 
                 except (TypeError, ValueError):
                     continue
 
-        print(
-            "[EXCHANGE] "
-            "Taxa EUR não encontrada. Usar 1.0."
-        )
+        print("[EXCHANGE] Taxa EUR não encontrada.")
 
     except Exception as exc:
-
-        print(
-            f"[EXCHANGE ERROR] {exc}"
-        )
-
-    return 1.0    except Exception as exc:
         print(f"[EXCHANGE ERROR] {exc}")
 
     print("[EXCHANGE] Não foi possível obter a taxa. Usar 1.0.")
