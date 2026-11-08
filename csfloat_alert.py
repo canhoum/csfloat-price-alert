@@ -190,7 +190,7 @@ def send_discord(
     baseline_eur = baseline_usd * usd_to_eur
     price_eur = price_usd * usd_to_eur
 
-    above_median = price_usd > baseline_usd
+    above_median = price_usd > (baseline_usd * 2)
 
     difference = (
         price_usd / baseline_usd
